@@ -22,13 +22,34 @@ import kotlin.concurrent.atomics.ExperimentalAtomicApi
  * @param engines non-empty list of network-bound engines, copied during construction
  */
 @OptIn(ExperimentalAtomicApi::class)
-class MultiNetworkHttpEngine(engines: List<HttpEngine>) : HttpEngine {
+class MultiNetworkHttpEngine internal constructor(
+  engines: List<HttpEngine>,
+  private val taskGeneration: TaskGeneration? = null,
+) : HttpEngine {
+  constructor(engines: List<HttpEngine>) : this(engines, null)
+
   private val engines = engines.toList()
   // -1 marks the engine closed; the index otherwise stays bounded by the delegate count.
   private val nextIndex = AtomicInt(0)
 
   init {
     require(this.engines.isNotEmpty()) { "At least one network engine is required" }
+  }
+
+  override fun forTask(
+    taskId: String,
+    generationId: Long,
+    lifecycleGate: TaskLifecycleGate,
+  ): HttpEngine {
+    val target = TaskGeneration(taskId = taskId, generationId = generationId)
+    val index = nextIndex.load()
+    if (index < 0) {
+      throw InactiveTaskEngineException(taskGeneration ?: target)
+    }
+    return MultiNetworkHttpEngine(
+      engines = engines.map { it.forTask(taskId, generationId, lifecycleGate) },
+      taskGeneration = target,
+    )
   }
 
   override suspend fun head(url: String, headers: Map<String, String>): ServerInfo =
@@ -68,7 +89,12 @@ class MultiNetworkHttpEngine(engines: List<HttpEngine>) : HttpEngine {
   private fun nextEngine(): HttpEngine {
     while (true) {
       val index = nextIndex.load()
-      check(index >= 0) { "Network engines are closed" }
+      if (index < 0) {
+        if (taskGeneration != null) {
+          throw InactiveTaskEngineException(taskGeneration)
+        }
+        error("Network engines are closed")
+      }
       val next = if (index == engines.lastIndex) 0 else index + 1
       if (nextIndex.compareAndSet(index, next)) return engines[index]
     }

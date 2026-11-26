@@ -38,6 +38,18 @@ internal class HttpDownloadSource(
 ) : DownloadSource<HttpSourceState> {
   private val log = KetchLogger("HttpSource")
 
+  fun forTask(
+    taskId: String,
+    generationId: Long = 0L,
+    lifecycleGate: TaskLifecycleGate = TaskLifecycleGate { },
+  ): HttpDownloadSource = HttpDownloadSource(
+    httpEngine = httpEngine.forTask(taskId, generationId, lifecycleGate),
+  )
+
+  override fun close() {
+    httpEngine.close()
+  }
+
   override val type: String = TYPE
 
   override val stateSerializer: KSerializer<HttpSourceState> = HttpSourceState.serializer()

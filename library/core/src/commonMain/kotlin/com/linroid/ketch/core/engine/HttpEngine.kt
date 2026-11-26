@@ -1,3 +1,5 @@
+@file:OptIn(ExperimentalAtomicApi::class)
+
 package com.linroid.ketch.core.engine
 
 import com.linroid.ketch.api.KetchError
@@ -183,17 +185,15 @@ internal class BorrowedTaskHttpEngine(
   private val delegate: HttpEngine,
   val generation: TaskGeneration,
   private val lifecycleGate: TaskLifecycleGate,
-  private val proxyOverride: Proxy? = null,
+  private val closed: AtomicBoolean = AtomicBoolean(false),
 ) : HttpEngine {
-
-  private val closed = AtomicBoolean(false)
 
   private fun activeDelegate(): HttpEngine {
     if (closed.load()) {
       throw InactiveTaskEngineException(generation)
     }
     lifecycleGate.checkActive(generation)
-    return if (proxyOverride != null) delegate.withProxy(proxyOverride) else delegate
+    return delegate
   }
 
   override suspend fun head(url: String, headers: Map<String, String>): ServerInfo =
@@ -243,7 +243,6 @@ internal class BorrowedTaskHttpEngine(
       delegate = delegate,
       generation = target,
       lifecycleGate = lifecycleGate,
-      proxyOverride = proxyOverride,
     )
   }
 
@@ -252,15 +251,15 @@ internal class BorrowedTaskHttpEngine(
       throw InactiveTaskEngineException(generation)
     }
     lifecycleGate.checkActive(generation)
-    val effectiveProxy = when (proxy) {
-      Proxy.System -> null
-      else -> proxy
+    if (proxy == Proxy.System) {
+      return this
     }
+    val proxiedDelegate = delegate.withProxy(proxy)
     return BorrowedTaskHttpEngine(
-      delegate = delegate,
+      delegate = proxiedDelegate,
       generation = generation,
       lifecycleGate = lifecycleGate,
-      proxyOverride = effectiveProxy,
+      closed = closed,
     )
   }
 
@@ -270,8 +269,6 @@ internal class BorrowedTaskHttpEngine(
   override fun close() {
     closed.store(true)
   }
-
-  internal fun resolveTargetForTest(): HttpEngine = activeDelegate()
 }
 
 /** This engine for [Proxy.System], which it follows by itself, else [HttpEngine.withProxy]. */
