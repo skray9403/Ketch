@@ -214,6 +214,14 @@ class HttpEngineTaskScopeTest {
     proxiedView.close()
     assertEquals(0, root.rootCloseCount)
     assertAllOperationsFailInactive(proxiedView)
+
+    // Closing a proxy view must not invalidate the parent task view; closing the parent closes derived views too
+    assertAllOperationsSucceed(taskView)
+    val secondProxiedView = taskView.withProxy(manualProxy)
+    taskView.close()
+    assertAllOperationsFailInactive(taskView)
+    assertAllOperationsFailInactive(secondProxiedView)
+    assertEquals(0, root.rootCloseCount)
   }
 
   @Test

@@ -185,11 +185,14 @@ internal class BorrowedTaskHttpEngine(
   private val delegate: HttpEngine,
   val generation: TaskGeneration,
   private val lifecycleGate: TaskLifecycleGate,
+  private val parentClosed: AtomicBoolean? = null,
   private val closed: AtomicBoolean = AtomicBoolean(false),
 ) : HttpEngine {
 
+  private fun isClosed(): Boolean = closed.load() || (parentClosed?.load() == true)
+
   private fun activeDelegate(): HttpEngine {
-    if (closed.load()) {
+    if (isClosed()) {
       throw InactiveTaskEngineException(generation)
     }
     lifecycleGate.checkActive(generation)
@@ -234,7 +237,7 @@ internal class BorrowedTaskHttpEngine(
     lifecycleGate: TaskLifecycleGate,
   ): HttpEngine {
     val target = TaskGeneration(taskId = taskId, generationId = generationId)
-    if (closed.load()) {
+    if (isClosed()) {
       throw InactiveTaskEngineException(target)
     }
     this.lifecycleGate.checkActive(this.generation)
@@ -247,7 +250,7 @@ internal class BorrowedTaskHttpEngine(
   }
 
   override fun withProxy(proxy: Proxy): HttpEngine {
-    if (closed.load()) {
+    if (isClosed()) {
       throw InactiveTaskEngineException(generation)
     }
     lifecycleGate.checkActive(generation)
@@ -259,7 +262,7 @@ internal class BorrowedTaskHttpEngine(
       delegate = proxiedDelegate,
       generation = generation,
       lifecycleGate = lifecycleGate,
-      closed = closed,
+      parentClosed = parentClosed ?: closed,
     )
   }
 
