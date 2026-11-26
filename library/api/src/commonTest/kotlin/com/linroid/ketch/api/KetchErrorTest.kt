@@ -137,6 +137,15 @@ class KetchErrorTest {
       Json.encodeToString(KetchError.serializer(), KetchError.Http(404, "Not Found")),
       Json.encodeToString(KetchError.tolerantSerializer(), KetchError.Http(404, "Not Found")),
     )
+    val http416 = KetchError.Http(
+      code = 416,
+      statusMessage = "Range Not Satisfiable",
+      cause = UnsatisfiedRangeResponse(totalBytes = 1000L, etag = "\"v1\"", lastModified = null),
+    )
+    assertEquals(
+      """{"type":"http","message":"HTTP error 416: Range Not Satisfiable","code":416,"statusMessage":"Range Not Satisfiable"}""",
+      Json.encodeToString(KetchError.serializer(), http416),
+    )
   }
 
   @Test

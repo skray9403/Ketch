@@ -4,6 +4,7 @@ import com.linroid.ketch.api.ConnectionRoute
 import com.linroid.ketch.api.KetchApi
 import com.linroid.ketch.api.KetchError
 import com.linroid.ketch.api.Proxy
+import com.linroid.ketch.api.UnsatisfiedRangeResponse
 import com.linroid.ketch.api.log.KetchLogger
 import com.linroid.ketch.api.log.describeCauses
 import com.linroid.ketch.api.log.redactUrl
@@ -552,14 +553,30 @@ class KtorHttpEngine private constructor(
   ): KetchError.Http {
     val status = response.status
     val request = if (logRequests) FailedRequest(method, response.request.url) else null
-    val error = if (status.value != 429) {
-      KetchError.Http(status.value, status.description, cause = request)
-    } else {
-      val retryAfter = parseRetryAfter(response.headers[HttpHeaders.RetryAfter])
-        ?: findRateLimitReset(response.headers)
-      val remaining = findRateLimitRemaining(response.headers)
-      if (logRequests) log.d { "Rate limit headers: retryAfter=$retryAfter, remaining=$remaining" }
-      KetchError.Http(status.value, status.description, retryAfter, remaining, request)
+    val error = when (status.value) {
+      429 -> {
+        val retryAfter = parseRetryAfter(response.headers[HttpHeaders.RetryAfter])
+          ?: findRateLimitReset(response.headers)
+        val remaining = findRateLimitRemaining(response.headers)
+        if (logRequests) log.d { "Rate limit headers: retryAfter=$retryAfter, remaining=$remaining" }
+        KetchError.Http(status.value, status.description, retryAfter, remaining, request)
+      }
+      HttpStatusCode.RequestedRangeNotSatisfiable.value -> {
+        val totalBytes = parseUnsatisfiedContentRangeTotal(response.headers[HttpHeaders.ContentRange])
+        val etag = response.headers[HttpHeaders.ETag]
+        val lastModified = response.headers[HttpHeaders.LastModified]
+        KetchError.Http(
+          code = status.value,
+          statusMessage = status.description,
+          cause = UnsatisfiedRangeResponse(
+            totalBytes = totalBytes,
+            etag = etag,
+            lastModified = lastModified,
+            cause = request,
+          ),
+        )
+      }
+      else -> KetchError.Http(status.value, status.description, cause = request)
     }
     if (logRequests) {
       val message = "HTTP error ${status.value}: ${status.description} " +
@@ -614,6 +631,14 @@ class KtorHttpEngine private constructor(
     private const val DIGEST = "Digest"
 
     private val CONTENT_RANGE = Regex("""bytes (\d+)-(\d+)/(\d+|\*)""", RegexOption.IGNORE_CASE)
+    private val UNSATISFIED_CONTENT_RANGE =
+      Regex("""bytes\s+\*/(\d+|\*)""", RegexOption.IGNORE_CASE)
+
+    /** Parses `Content-Range: bytes &#42;/N` on HTTP 416; `bytes &#42;/&#42;` or malformed returns `null`. */
+    internal fun parseUnsatisfiedContentRangeTotal(value: String?): Long? {
+      val match = value?.trim()?.let { UNSATISFIED_CONTENT_RANGE.matchEntire(it) } ?: return null
+      return match.groupValues[1].let { if (it == "*") null else it.toLongOrNull() }
+    }
 
     /** [headers] for a debug log line, with the values of [SENSITIVE_HEADERS] masked. */
     private fun describeHeaders(headers: Headers): String =

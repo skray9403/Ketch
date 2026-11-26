@@ -5,12 +5,14 @@ import com.linroid.ketch.api.KetchError
 import com.linroid.ketch.api.ResolveInput
 import com.linroid.ketch.api.ResolvedSource
 import com.linroid.ketch.api.Segment
+import com.linroid.ketch.api.UnsatisfiedRangeResponse
 import com.linroid.ketch.core.file.DefaultFileNameResolver
 import com.linroid.ketch.api.log.KetchLogger
 import com.linroid.ketch.api.log.redactUrl
 import com.linroid.ketch.core.segment.SegmentCalculator
 import com.linroid.ketch.core.segment.SegmentDownloader
 import com.linroid.ketch.core.segment.SegmentedDownloadHelper
+import com.linroid.ketch.core.segment.SequentialLengthMismatchException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -210,7 +212,8 @@ internal class HttpDownloadSource(
     downloadRanges(
       context, segments, totalBytes, resolved.supportsResume, requested,
       quotaLimited = remaining != null,
-      validator = resolved.metadata.let { rangeValidator(it[META_ETAG], it[META_LAST_MODIFIED]) },
+      expectedEtag = resolved.metadata[META_ETAG],
+      expectedLastModified = resolved.metadata[META_LAST_MODIFIED],
     )
   }
 
@@ -292,7 +295,8 @@ internal class HttpDownloadSource(
     downloadRanges(
       context, validatedSegments, totalBytes, serverInfo.supportsResume, requested,
       quotaLimited = serverInfo.rateLimitRemaining != null,
-      validator = rangeValidator(state.etag, state.lastModified),
+      expectedEtag = state.etag,
+      expectedLastModified = state.lastModified,
     )
   }
 
@@ -353,10 +357,14 @@ internal class HttpDownloadSource(
     supportsRanges: Boolean,
     requestedConnections: Int,
     quotaLimited: Boolean,
-    validator: String?,
+    expectedEtag: String?,
+    expectedLastModified: String?,
   ) {
-    val headers = if (supportsRanges && validator != null) {
-      context.headers + (IF_RANGE to validator)
+    val validator = rangeValidator(expectedEtag, expectedLastModified)
+    val fallbackHeaders = context.headers.filterKeys { !it.equals(IF_RANGE, ignoreCase = true) }
+    val hadValidator = supportsRanges && validator != null
+    val headers = if (hadValidator) {
+      fallbackHeaders + (IF_RANGE to validator)
     } else {
       context.headers
     }
@@ -371,18 +379,66 @@ internal class HttpDownloadSource(
         "Server ignored ranges for taskId=${context.taskId}, restarting from zero " +
           "over one connection"
       }
-      val whole = SegmentCalculator.singleSegment(totalBytes)
-      context.segments.value = whole
-      try {
-        downloadSegments(
-          context, whole, totalBytes, supportsRanges = false, requestedConnections, quotaLimited,
-          headers,
+      restartWholeResource(
+        context, totalBytes, requestedConnections, quotaLimited, fallbackHeaders, hadValidator,
+      )
+    } catch (e: KetchError.Http) {
+      if (e.code != 416) throw e
+      val details = e.cause as? UnsatisfiedRangeResponse
+      val totalFromServer = details?.totalBytes
+      if (totalFromServer != null && totalFromServer != totalBytes) {
+        throw KetchError.FileChanged(
+          "Server reported $totalFromServer bytes on HTTP 416, expected $totalBytes",
+          e,
         )
-      } catch (again: KetchError.Unsupported) {
-        // The whole file, of another size than when the download started.
-        if (headers === context.headers || again.cause !is RangeIgnoredException) throw again
-        throw KetchError.FileChanged("The file changed on the server while it downloaded", again)
       }
+      val currentSegments = context.segments.value
+      val validatorsChanged =
+        (expectedEtag != null && details?.etag != null && details.etag != expectedEtag) ||
+          (expectedLastModified != null && details?.lastModified != null &&
+            details.lastModified != expectedLastModified)
+      if (
+        totalFromServer == totalBytes &&
+        currentSegments.isNotEmpty() &&
+        currentSegments.all { it.isComplete } &&
+        currentSegments.sumOf { it.downloadedBytes } == totalBytes &&
+        !validatorsChanged
+      ) {
+        context.onProgress(totalBytes, totalBytes)
+        return
+      }
+      if (!supportsRanges) throw e
+      log.w {
+        "Range request rejected with HTTP 416 for taskId=${context.taskId}, " +
+          "restarting from zero over one connection"
+      }
+      restartWholeResource(
+        context, totalBytes, requestedConnections, quotaLimited, fallbackHeaders, hadValidator,
+      )
+    }
+  }
+
+  private suspend fun restartWholeResource(
+    context: DownloadContext,
+    totalBytes: Long,
+    requestedConnections: Int,
+    quotaLimited: Boolean,
+    fallbackHeaders: Map<String, String>,
+    hadValidator: Boolean,
+  ) {
+    val whole = SegmentCalculator.singleSegment(totalBytes)
+    context.segments.value = whole
+    try {
+      downloadSegments(
+        context, whole, totalBytes, supportsRanges = false, requestedConnections, quotaLimited,
+        fallbackHeaders,
+      )
+    } catch (again: KetchError.Unsupported) {
+      // The whole file, of another size than when the download started.
+      val isSizeOrRangeMismatch =
+        again.cause is RangeIgnoredException || again.cause is SequentialLengthMismatchException
+      if (!hadValidator || !isSizeOrRangeMismatch) throw again
+      throw KetchError.FileChanged("The file changed on the server while it downloaded", again)
     }
   }
 
@@ -408,6 +464,13 @@ internal class HttpDownloadSource(
     quotaLimited: Boolean,
     headers: Map<String, String>,
   ) {
+    val effectiveSegments = if (
+      !supportsRanges && (segments.isEmpty() || segments.any { it.downloadedBytes > 0L })
+    ) {
+      SegmentCalculator.singleSegment(totalBytes).also { context.segments.value = it }
+    } else {
+      segments
+    }
     val segmentHelper = if (quotaLimited) {
       SegmentedDownloadHelper(
         progressIntervalMs = context.config.progressIntervalMs,
@@ -422,7 +485,7 @@ internal class HttpDownloadSource(
     }
     val engine = httpEngine.through(context.config.proxy)
     segmentHelper.downloadAll(
-      context, segments, totalBytes, supportsRanges, requestedConnections,
+      context, effectiveSegments, totalBytes, supportsRanges, requestedConnections,
     ) { lane ->
       val throttleLimiter = object : SpeedLimiter {
         override suspend fun acquire(bytes: Int) {
@@ -438,7 +501,7 @@ internal class HttpDownloadSource(
       val handle = if (lane.isComplete) ConnectionHandle.None else context.connections.open(spec)
       try {
         observeExchanges(handle, spec) {
-          downloader.download(context.url, lane, headers, handle)
+          downloader.download(context.url, lane, headers, handle, useRange = supportsRanges)
         }
       } finally {
         handle.close()

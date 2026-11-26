@@ -8,6 +8,7 @@ import com.linroid.ketch.core.engine.DownloadContext
 import com.linroid.ketch.core.file.NoOpFileAccessor
 import com.linroid.ketch.core.segment.SegmentLane
 import com.linroid.ketch.core.segment.SegmentedDownloadHelper
+import com.linroid.ketch.core.segment.SequentialLengthMismatchException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
@@ -90,6 +91,21 @@ class SegmentedDownloadHelperTest {
       }
     }
     assertEquals(3L, context.segments.value.single().downloadedBytes)
+  }
+
+  @Test
+  fun downloadAll_sequentialLengthMismatchOnCompletedLane_isNotSwallowed() = runTest {
+    val context = context()
+    val error = assertFailsWith<KetchError.Unsupported> {
+      SegmentedDownloadHelper().downloadAll(
+        context, context.segments.value, 12, supportsRanges = false,
+      ) { lane ->
+        lane.fill()
+        assertTrue(lane.isComplete)
+        throw KetchError.Unsupported(SequentialLengthMismatchException("oversized"))
+      }
+    }
+    assertTrue(error.cause is SequentialLengthMismatchException)
   }
 
   @Test

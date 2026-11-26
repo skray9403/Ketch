@@ -2171,6 +2171,14 @@ public final class com/linroid/ketch/api/SystemInfo$Companion {
 	public final fun serializer ()Lkotlinx/serialization/KSerializer;
 }
 
+public final class com/linroid/ketch/api/UnsatisfiedRangeResponse : java/lang/IllegalStateException {
+	public fun <init> (Ljava/lang/Long;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)V
+	public synthetic fun <init> (Ljava/lang/Long;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
+	public final fun getEtag ()Ljava/lang/String;
+	public final fun getLastModified ()Ljava/lang/String;
+	public final fun getTotalBytes ()Ljava/lang/Long;
+}
+
 public final class com/linroid/ketch/api/Weekday : java/lang/Enum {
 	public static final field Companion Lcom/linroid/ketch/api/Weekday$Companion;
 	public static final field Friday Lcom/linroid/ketch/api/Weekday;

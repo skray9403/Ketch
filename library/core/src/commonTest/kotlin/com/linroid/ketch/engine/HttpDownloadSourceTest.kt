@@ -3,6 +3,8 @@ package com.linroid.ketch.engine
 import com.linroid.ketch.api.DownloadConfig
 import com.linroid.ketch.api.DownloadRequest
 import com.linroid.ketch.api.KetchError
+import com.linroid.ketch.api.Segment
+import com.linroid.ketch.api.UnsatisfiedRangeResponse
 import com.linroid.ketch.core.engine.DownloadContext
 import com.linroid.ketch.core.engine.HttpDownloadSource
 import com.linroid.ketch.core.engine.HttpEngine
@@ -12,6 +14,7 @@ import com.linroid.ketch.core.engine.ServerInfo
 import com.linroid.ketch.core.engine.resolve
 import com.linroid.ketch.core.file.FileAccessor
 import com.linroid.ketch.core.file.NoOpFileAccessor
+import com.linroid.ketch.core.segment.SequentialLengthMismatchException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.runTest
@@ -20,6 +23,9 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class HttpDownloadSourceTest {
@@ -117,7 +123,7 @@ class HttpDownloadSourceTest {
     HttpDownloadSource(engine).download(context, null)
 
     assertContentEquals(engine.content, file.bytes)
-    assertEquals(0L..999L, engine.lastDownloadRange)
+    assertNull(engine.lastDownloadRange)
     assertEquals(1000L, context.segments.value.single().downloadedBytes)
   }
 
@@ -400,7 +406,11 @@ class HttpDownloadSourceTest {
       val replaced = ++transfers > replaceAfter
       val content = if (replaced) after else before
       val current = if (replaced) "\"b\"" else "\"a\""
-      val asked = checkNotNull(range)
+      if (range == null) {
+        onData(content)
+        return
+      }
+      val asked = range
       if (headers["If-Range"] == current) return onData(content.sliceArray(asked.toIntRange()))
       // Changed: the whole file, which only a range of all of it, and of its size, takes.
       if (asked.first != 0L || asked.last != content.size - 1L) {
@@ -412,6 +422,260 @@ class HttpDownloadSourceTest {
     override fun close() {}
 
     private fun LongRange.toIntRange() = first.toInt()..last.toInt()
+  }
+
+  @Test
+  fun download_rangeFallback_stripsIfRangePreservesUserHeadersAndUsesNullRange() = runTest {
+    val seenRanges = mutableListOf<LongRange?>()
+    val seenHeaders = mutableListOf<Map<String, String>>()
+    val content = ByteArray(1000) { (it % 127).toByte() }
+    val engine = object : FakeHttpEngine(
+      serverInfo = ServerInfo(1000L, acceptRanges = true, etag = "\"v1\"", lastModified = null),
+      content = content,
+    ) {
+      var calls = 0
+      override suspend fun download(
+        url: String,
+        range: LongRange?,
+        headers: Map<String, String>,
+        onData: suspend (ByteArray) -> Unit,
+      ) {
+        seenRanges += range
+        seenHeaders += headers
+        if (++calls == 1) throw KetchError.Unsupported(RangeIgnoredException())
+        onData(content)
+      }
+    }
+    val file = MemoryFile()
+    val context = DownloadContext(
+      taskId = "fallback-headers",
+      url = "https://example.com/file",
+      request = DownloadRequest("https://example.com/file"),
+      fileAccessor = file,
+      segments = MutableStateFlow(emptyList()),
+      onProgress = { _, _ -> },
+      throttle = {},
+      headers = mapOf("Authorization" to "Bearer tok", "if-range" to "\"stale\""),
+      maxConnections = MutableStateFlow(2),
+      config = DownloadConfig.Default,
+    )
+
+    HttpDownloadSource(engine).download(context, null)
+
+    assertContentEquals(content, file.bytes)
+    assertEquals("\"v1\"", seenHeaders.first()["If-Range"])
+    assertEquals(null, seenRanges.last())
+    val fallback = seenHeaders.last()
+    assertFalse(fallback.keys.any { it.equals("If-Range", ignoreCase = true) })
+    assertEquals("Bearer tok", fallback["Authorization"])
+  }
+
+  @Test
+  fun download_fallbackEmptyOrOversizedResponse_failsAsFileChangedWhenValidatorPresent() = runTest {
+    for (fallbackBytes in listOf(ByteArray(0), ByteArray(1200) { 3 })) {
+      val engine = object : FakeHttpEngine(
+        serverInfo = ServerInfo(1000L, acceptRanges = true, etag = "\"v1\"", lastModified = null),
+      ) {
+        var calls = 0
+        override suspend fun download(
+          url: String,
+          range: LongRange?,
+          headers: Map<String, String>,
+          onData: suspend (ByteArray) -> Unit,
+        ) {
+          if (++calls == 1) throw KetchError.Unsupported(RangeIgnoredException())
+          if (fallbackBytes.isNotEmpty()) onData(fallbackBytes)
+        }
+      }
+      assertFailsWith<KetchError.FileChanged> {
+        HttpDownloadSource(engine).download(
+          context(config = DownloadConfig(maxConnectionsPerDownload = 2), fileAccessor = MemoryFile()),
+          null,
+        )
+      }
+    }
+  }
+
+  @Test
+  fun resume_nonRangeServerWithEmptyOrStaleSegments_normalizesAndDownloadsFromZero() = runTest {
+    val content = ByteArray(1000) { (it % 251).toByte() }
+    val seenRanges = mutableListOf<LongRange?>()
+    val engine = object : FakeHttpEngine(
+      serverInfo = ServerInfo(1000L, acceptRanges = false, etag = null, lastModified = null),
+      content = content,
+    ) {
+      override suspend fun download(
+        url: String,
+        range: LongRange?,
+        headers: Map<String, String>,
+        onData: suspend (ByteArray) -> Unit,
+      ) {
+        seenRanges += range
+        onData(content)
+      }
+    }
+    val file = MemoryFile(ByteArray(1000))
+    val context = context(fileAccessor = file)
+    context.segments.value = listOf(Segment(index = 0, start = 0, end = 999, downloadedBytes = 1000))
+
+    HttpDownloadSource(engine).download(
+      context,
+      HttpSourceState(etag = null, lastModified = null, totalBytes = 1000L),
+    )
+
+    assertContentEquals(content, file.bytes)
+    assertEquals(listOf<LongRange?>(null), seenRanges)
+    assertEquals(1000L, context.segments.value.single().downloadedBytes)
+  }
+
+  @Test
+  fun download_http416WithMismatchedTotalBytes_failsAsFileChanged() = runTest {
+    val engine = object : FakeHttpEngine(
+      serverInfo = ServerInfo(1000L, acceptRanges = true, etag = "\"v1\"", lastModified = null),
+    ) {
+      override suspend fun download(
+        url: String,
+        range: LongRange?,
+        headers: Map<String, String>,
+        onData: suspend (ByteArray) -> Unit,
+      ) {
+        throw KetchError.Http(
+          code = 416,
+          statusMessage = "Range Not Satisfiable",
+          cause = UnsatisfiedRangeResponse(totalBytes = 750L, etag = "\"v1\"", lastModified = null),
+        )
+      }
+    }
+    assertFailsWith<KetchError.FileChanged> {
+      HttpDownloadSource(engine).download(context(fileAccessor = MemoryFile()), null)
+    }
+  }
+
+  @Test
+  fun download_http416WithExactCompletedSegments_completesWithoutRedownload() = runTest {
+    val content = ByteArray(1000) { (it % 251).toByte() }
+    var downloadCalls = 0
+    val racingEngine = object : FakeHttpEngine(
+      serverInfo = ServerInfo(1000L, acceptRanges = true, etag = "\"v1\"", lastModified = null),
+      content = content,
+    ) {
+      override suspend fun download(
+        url: String,
+        range: LongRange?,
+        headers: Map<String, String>,
+        onData: suspend (ByteArray) -> Unit,
+      ) {
+        downloadCalls++
+        onData(content)
+        throw KetchError.Http(
+          code = 416,
+          statusMessage = "Range Not Satisfiable",
+          cause = UnsatisfiedRangeResponse(totalBytes = 1000L, etag = "\"v1\"", lastModified = null),
+        )
+      }
+    }
+    var finalProgress = 0L to 0L
+    val exactCtx = context(
+      connections = MutableStateFlow(1),
+      fileAccessor = MemoryFile(),
+      onProgress = { d, t -> finalProgress = d to t },
+    )
+    HttpDownloadSource(racingEngine).download(exactCtx, null)
+    assertEquals(1, downloadCalls)
+    assertEquals(1000L to 1000L, finalProgress)
+    assertTrue(exactCtx.segments.value.all { it.isComplete })
+  }
+
+  @Test
+  fun download_http416WithNullTotal_fallsBackOnceWithoutLooping() = runTest {
+    val content = ByteArray(1000) { (it % 199).toByte() }
+    val seenRanges = mutableListOf<LongRange?>()
+    val seenHeaders = mutableListOf<Map<String, String>>()
+    val engine = object : FakeHttpEngine(
+      serverInfo = ServerInfo(1000L, acceptRanges = true, etag = "\"v1\"", lastModified = null),
+      content = content,
+    ) {
+      var calls = 0
+      override suspend fun download(
+        url: String,
+        range: LongRange?,
+        headers: Map<String, String>,
+        onData: suspend (ByteArray) -> Unit,
+      ) {
+        seenRanges += range
+        seenHeaders += headers
+        if (++calls == 1) {
+          onData(content.copyOfRange(0, 200))
+          throw KetchError.Http(
+            code = 416,
+            statusMessage = "Range Not Satisfiable",
+            cause = UnsatisfiedRangeResponse(totalBytes = null, etag = null, lastModified = null),
+          )
+        }
+        onData(content)
+      }
+    }
+    val file = MemoryFile()
+    HttpDownloadSource(engine).download(
+      context(connections = MutableStateFlow(1), fileAccessor = file),
+      null,
+    )
+    assertContentEquals(content, file.bytes)
+    assertEquals(listOf(0L..999L, null), seenRanges)
+    assertNull(seenHeaders.last()["If-Range"])
+
+    // Second 416 from fallback must propagate directly without looping.
+    var loopingCalls = 0
+    val always416 = object : FakeHttpEngine(
+      serverInfo = ServerInfo(1000L, acceptRanges = true, etag = "\"v1\"", lastModified = null),
+    ) {
+      override suspend fun download(
+        url: String,
+        range: LongRange?,
+        headers: Map<String, String>,
+        onData: suspend (ByteArray) -> Unit,
+      ) {
+        loopingCalls++
+        throw KetchError.Http(
+          code = 416,
+          statusMessage = "Range Not Satisfiable",
+          cause = UnsatisfiedRangeResponse(totalBytes = null, etag = null, lastModified = null),
+        )
+      }
+    }
+    val secondError = assertFailsWith<KetchError.Http> {
+      HttpDownloadSource(always416).download(
+        context(connections = MutableStateFlow(1), fileAccessor = MemoryFile()),
+        null,
+      )
+    }
+    assertEquals(416, secondError.code)
+    assertEquals(2, loopingCalls)
+
+    // Non-range 416 must propagate directly without duplicate full GET.
+    var nonRangeCalls = 0
+    val nonRange416 = object : FakeHttpEngine(
+      serverInfo = ServerInfo(1000L, acceptRanges = false, etag = null, lastModified = null),
+    ) {
+      override suspend fun download(
+        url: String,
+        range: LongRange?,
+        headers: Map<String, String>,
+        onData: suspend (ByteArray) -> Unit,
+      ) {
+        nonRangeCalls++
+        throw KetchError.Http(
+          code = 416,
+          statusMessage = "Range Not Satisfiable",
+          cause = UnsatisfiedRangeResponse(totalBytes = null, etag = null, lastModified = null),
+        )
+      }
+    }
+    val nonRangeError = assertFailsWith<KetchError.Http> {
+      HttpDownloadSource(nonRange416).download(context(fileAccessor = MemoryFile()), null)
+    }
+    assertEquals(416, nonRangeError.code)
+    assertEquals(1, nonRangeCalls)
   }
 }
 

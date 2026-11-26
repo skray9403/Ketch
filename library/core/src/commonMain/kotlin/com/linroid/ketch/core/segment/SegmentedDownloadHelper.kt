@@ -316,6 +316,7 @@ class SegmentedDownloadHelper(
           try {
             downloadSegment(lane)
           } catch (e: Exception) {
+            if (e is KetchError.Unsupported && e.cause is SequentialLengthMismatchException) throw e
             if (!lane.isComplete) throw e
           }
         }
