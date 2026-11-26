@@ -3,9 +3,6 @@ package com.linroid.ketch.core.engine
 import com.linroid.ketch.api.KetchError
 import com.linroid.ketch.api.Proxy
 import kotlinx.coroutines.test.runTest
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -18,23 +15,23 @@ class HttpEngineTaskScopeTest {
     var failureToThrow: Throwable? = null,
     val supportsProxyVal: Boolean = true,
   ) : HttpEngine {
-    val rootCloseCount = AtomicInteger(0)
+    var rootCloseCount = 0
     val recordedProxies = mutableListOf<Proxy>()
-    val headCalls = AtomicInteger(0)
-    val probeCalls = AtomicInteger(0)
-    val downloadCalls = AtomicInteger(0)
-    val downloadResourceCalls = AtomicInteger(0)
-    val requestCalls = AtomicInteger(0)
+    var headCalls = 0
+    var probeCalls = 0
+    var downloadCalls = 0
+    var downloadResourceCalls = 0
+    var requestCalls = 0
 
     override suspend fun head(url: String, headers: Map<String, String>): ServerInfo {
       failureToThrow?.let { throw it }
-      headCalls.incrementAndGet()
+      headCalls++
       return ServerInfo(contentLength = 100L, acceptRanges = true, etag = null, lastModified = null, url = url)
     }
 
     override suspend fun probe(url: String, headers: Map<String, String>): ServerInfo {
       failureToThrow?.let { throw it }
-      probeCalls.incrementAndGet()
+      probeCalls++
       return ServerInfo(contentLength = 100L, acceptRanges = true, etag = null, lastModified = null, url = url)
     }
 
@@ -45,7 +42,7 @@ class HttpEngineTaskScopeTest {
       onData: suspend (ByteArray) -> Unit,
     ) {
       failureToThrow?.let { throw it }
-      downloadCalls.incrementAndGet()
+      downloadCalls++
       onData(byteArrayOf(1, 2, 3))
     }
 
@@ -55,7 +52,7 @@ class HttpEngineTaskScopeTest {
       onData: suspend (ByteArray) -> Unit,
     ): String {
       failureToThrow?.let { throw it }
-      downloadResourceCalls.incrementAndGet()
+      downloadResourceCalls++
       onData(byteArrayOf(1, 2, 3))
       return url
     }
@@ -68,7 +65,7 @@ class HttpEngineTaskScopeTest {
       maxBodyBytes: Int,
     ): HttpReply {
       failureToThrow?.let { throw it }
-      requestCalls.incrementAndGet()
+      requestCalls++
       return HttpReply(status = 200, headers = emptyMap(), body = byteArrayOf())
     }
 
@@ -83,24 +80,26 @@ class HttpEngineTaskScopeTest {
     }
 
     override fun close() {
-      rootCloseCount.incrementAndGet()
+      rootCloseCount++
     }
   }
 
   private class FakeGenerationRegistry {
-    private val seq = AtomicLong(0L)
-    private val activeGenerations = ConcurrentHashMap<String, Long>()
-    private val closedGenerations = ConcurrentHashMap.newKeySet<TaskGeneration>()
+    private var seq = 0L
+    private val activeGenerations = mutableMapOf<String, Long>()
+    private val closedGenerations = mutableSetOf<TaskGeneration>()
 
     fun openTask(taskId: String): TaskGeneration {
-      val gen = TaskGeneration(taskId = taskId, generationId = seq.incrementAndGet())
+      val gen = TaskGeneration(taskId = taskId, generationId = ++seq)
       activeGenerations[taskId] = gen.generationId
       return gen
     }
 
     fun closeTask(generation: TaskGeneration) {
       closedGenerations.add(generation)
-      activeGenerations.remove(generation.taskId, generation.generationId)
+      if (activeGenerations[generation.taskId] == generation.generationId) {
+        activeGenerations.remove(generation.taskId)
+      }
     }
 
     fun gate(): TaskLifecycleGate = TaskLifecycleGate { requested ->
@@ -172,16 +171,16 @@ class HttpEngineTaskScopeTest {
     assertEquals(genA, viewA.generation)
 
     assertAllOperationsSucceed(viewA)
-    assertEquals(1, root.headCalls.get())
-    assertEquals(1, root.probeCalls.get())
-    assertEquals(1, root.downloadCalls.get())
-    assertEquals(1, root.downloadResourceCalls.get())
-    assertEquals(1, root.requestCalls.get())
+    assertEquals(1, root.headCalls)
+    assertEquals(1, root.probeCalls)
+    assertEquals(1, root.downloadCalls)
+    assertEquals(1, root.downloadResourceCalls)
+    assertEquals(1, root.requestCalls)
 
     viewA.close()
     viewA.close() // repeated close is safe and non-destructive
 
-    assertEquals(0, root.rootCloseCount.get())
+    assertEquals(0, root.rootCloseCount)
     assertAllOperationsFailInactive(viewA)
   }
 
@@ -213,7 +212,7 @@ class HttpEngineTaskScopeTest {
     }
 
     proxiedView.close()
-    assertEquals(0, root.rootCloseCount.get())
+    assertEquals(0, root.rootCloseCount)
     assertAllOperationsFailInactive(proxiedView)
   }
 
@@ -232,7 +231,7 @@ class HttpEngineTaskScopeTest {
 
     assertAllOperationsFailInactive(viewA)
     assertAllOperationsSucceed(viewB)
-    assertEquals(0, root.rootCloseCount.get())
+    assertEquals(0, root.rootCloseCount)
   }
 
   @Test
@@ -265,7 +264,7 @@ class HttpEngineTaskScopeTest {
     assertSame(boom, thrown)
 
     root.close()
-    assertEquals(1, root.rootCloseCount.get())
+    assertEquals(1, root.rootCloseCount)
   }
 
   @Test
@@ -281,21 +280,21 @@ class HttpEngineTaskScopeTest {
     // Round-robin to rootA
     val infoA = taskMulti.head("https://example.com/1")
     assertEquals(100L, infoA.contentLength)
-    assertEquals(1, rootA.headCalls.get())
-    assertEquals(0, rootB.headCalls.get())
+    assertEquals(1, rootA.headCalls)
+    assertEquals(0, rootB.headCalls)
 
     // Round-robin to rootB
     val infoB = taskMulti.head("https://example.com/2")
     assertEquals(100L, infoB.contentLength)
-    assertEquals(1, rootA.headCalls.get())
-    assertEquals(1, rootB.headCalls.get())
+    assertEquals(1, rootA.headCalls)
+    assertEquals(1, rootB.headCalls)
 
     // Close taskMulti
     taskMulti.close()
 
     // Roots must not be closed!
-    assertEquals(0, rootA.rootCloseCount.get())
-    assertEquals(0, rootB.rootCloseCount.get())
+    assertEquals(0, rootA.rootCloseCount)
+    assertEquals(0, rootB.rootCloseCount)
 
     // Calling closed taskMulti fails with InactiveTaskEngineException
     assertFailsWith<InactiveTaskEngineException> {
@@ -304,11 +303,11 @@ class HttpEngineTaskScopeTest {
 
     // Roots are still usable through original multi
     multi.head("https://example.com/4")
-    assertEquals(3, rootA.headCalls.get() + rootB.headCalls.get())
+    assertEquals(3, rootA.headCalls + rootB.headCalls)
 
     // Explicit close on root multi closes roots
     multi.close()
-    assertEquals(1, rootA.rootCloseCount.get())
-    assertEquals(1, rootB.rootCloseCount.get())
+    assertEquals(1, rootA.rootCloseCount)
+    assertEquals(1, rootB.rootCloseCount)
   }
 }
