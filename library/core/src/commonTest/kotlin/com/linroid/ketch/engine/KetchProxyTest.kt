@@ -145,16 +145,24 @@ class KetchProxyTest {
 
   /** Serves [fake] and records the proxy each request went through. */
   private class ProxyRecordingEngine(
-    private val fake: FakeHttpEngine = FakeHttpEngine(),
-  ) : HttpEngine by fake {
+    fake: FakeHttpEngine = FakeHttpEngine(),
+  ) : FakeHttpEngine(
+    serverInfo = fake.serverInfo,
+    content = fake.content,
+    chunkSize = fake.chunkSize,
+  ) {
     val proxies = mutableListOf<Proxy>()
 
     override val supportsProxies: Boolean = true
 
-    override fun withProxy(proxy: Proxy): HttpEngine = object : HttpEngine by fake {
+    override fun withProxy(proxy: Proxy): HttpEngine = object : FakeHttpEngine(
+      serverInfo = this@ProxyRecordingEngine.serverInfo,
+      content = this@ProxyRecordingEngine.content,
+      chunkSize = this@ProxyRecordingEngine.chunkSize,
+    ) {
       override suspend fun head(url: String, headers: Map<String, String>): ServerInfo {
         proxies += proxy
-        return fake.head(url, headers)
+        return this@ProxyRecordingEngine.head(url, headers)
       }
 
       override suspend fun download(
@@ -164,7 +172,7 @@ class KetchProxyTest {
         onData: suspend (ByteArray) -> Unit,
       ) {
         proxies += proxy
-        fake.download(url, range, headers, onData)
+        this@ProxyRecordingEngine.download(url, range, headers, onData)
       }
     }
   }

@@ -18,7 +18,7 @@ import kotlinx.coroutines.delay
  * refuses only `HEAD`, as a URL presigned for `GET` does, while [probe] still answers. Each
  * transfer reports [exchange], when set, to the caller's [HttpExchangeObserver].
  */
-class FakeHttpEngine(
+open class FakeHttpEngine(
   var serverInfo: ServerInfo = ServerInfo(
     contentLength = 1000,
     acceptRanges = true,

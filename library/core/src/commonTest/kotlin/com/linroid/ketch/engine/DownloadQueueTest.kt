@@ -840,7 +840,7 @@ class DownloadQueueTest {
   }
 
   /** Records probed URLs and keeps every started download waiting in its HEAD request. */
-  private class BlockingHeadEngine : HttpEngine by FakeHttpEngine() {
+  private class BlockingHeadEngine : FakeHttpEngine() {
     val probed = mutableListOf<String>()
 
     override suspend fun head(url: String, headers: Map<String, String>): ServerInfo {
