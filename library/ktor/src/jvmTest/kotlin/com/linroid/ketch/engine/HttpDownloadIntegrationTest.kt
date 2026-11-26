@@ -10,6 +10,7 @@ import com.linroid.ketch.api.DownloadTask
 import com.linroid.ketch.api.KetchError
 import com.linroid.ketch.core.Ketch
 import com.linroid.ketch.core.engine.HttpEngine
+import com.linroid.ketch.core.engine.TaskLifecycleGate
 import com.linroid.ketch.sqlite.DriverFactory
 import com.linroid.ketch.sqlite.SqliteTaskStore
 import com.sun.net.httpserver.HttpServer
@@ -385,6 +386,12 @@ class HttpDownloadIntegrationTest {
     private fun newKetch(): Ketch {
       val transport = KtorHttpEngine()
       val engine = object : HttpEngine by transport {
+        override fun forTask(
+          taskId: String,
+          generationId: Long,
+          lifecycleGate: TaskLifecycleGate,
+        ): HttpEngine = super<HttpEngine>.forTask(taskId, generationId, lifecycleGate)
+
         override suspend fun download(
           url: String,
           range: LongRange?,
