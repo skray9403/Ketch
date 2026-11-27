@@ -2,6 +2,9 @@ package com.linroid.ketch.adm.http
 
 import com.linroid.ketch.adm.http.cookies.PublicSuffixMatcher
 import com.linroid.ketch.adm.http.cookies.TaskCookieJar
+import com.linroid.ketch.adm.http.probe.AdmProbe
+import com.linroid.ketch.adm.http.probe.AdmProbeConfig
+import com.linroid.ketch.adm.http.probe.ProbeCache
 import com.linroid.ketch.core.engine.InactiveTaskEngineException
 import com.linroid.ketch.core.engine.TaskGeneration
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -19,6 +22,8 @@ class AdmTaskState(
   clock: () -> Long = System::currentTimeMillis,
   publicSuffixMatcher: PublicSuffixMatcher = PublicSuffixMatcher.NONE,
   redirectConfig: AdmRedirectConfig = AdmRedirectConfig(),
+  probeConfig: AdmProbeConfig = AdmProbeConfig(),
+  ruleVersionProvider: () -> Long = { 0L },
 ) {
   val generation: TaskGeneration = TaskGeneration(taskId = taskId, generationId = generationId)
 
@@ -36,8 +41,22 @@ class AdmTaskState(
     config = redirectConfig,
   )
 
+  val probeCache: ProbeCache = ProbeCache(
+    taskState = this,
+    clock = clock,
+    ruleVersionProvider = ruleVersionProvider,
+  )
+
+  val admProbe: AdmProbe = AdmProbe(
+    taskState = this,
+    config = probeConfig,
+  )
+
   init {
-    onClose { cookies.clearOnClose() }
+    onClose {
+      cookies.clearOnClose()
+      probeCache.clearOnClose()
+    }
   }
 
   val isClosed: Boolean get() = closed.get()

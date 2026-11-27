@@ -74,6 +74,13 @@ class AdmRedirectHandler internal constructor(
     transport.execute(hopRequest)
   }
 
+  suspend fun openStream(
+    request: AdmRequest,
+    transport: AdmHttpTransport,
+  ): AdmRedirectResult = runPipeline(request) { hopRequest ->
+    transport.openStream(hopRequest)
+  }
+
   suspend fun stream(
     request: AdmRequest,
     range: LongRange?,
@@ -155,6 +162,9 @@ class AdmRedirectHandler internal constructor(
           redirectCount = redirects,
         )
       }
+
+      // Close any intermediate redirect body before following the next hop.
+      response.streamingBody?.close()
 
       if (redirects >= config.maxRedirects) {
         throw TooManyRedirectsException(maxRedirects = config.maxRedirects, visitedUrls = visitedUrls)

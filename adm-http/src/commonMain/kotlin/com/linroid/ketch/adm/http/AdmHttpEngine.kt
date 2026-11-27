@@ -2,6 +2,10 @@ package com.linroid.ketch.adm.http
 
 import com.linroid.ketch.adm.http.cookies.PublicSuffixMatcher
 import com.linroid.ketch.adm.http.cookies.TaskCookieJar
+import com.linroid.ketch.adm.http.probe.AdmProbeConfig
+import com.linroid.ketch.adm.http.probe.AdmProbeResult
+import com.linroid.ketch.adm.http.probe.ProbeCache
+import com.linroid.ketch.adm.http.probe.ProbeValidators
 import com.linroid.ketch.api.Proxy
 import com.linroid.ketch.core.engine.HttpBody
 import com.linroid.ketch.core.engine.HttpEngine
@@ -23,8 +27,10 @@ import java.util.concurrent.atomic.AtomicLong
 class AdmHttpEngine(
   private val rootResources: RootResources,
   private val redirectConfig: AdmRedirectConfig = AdmRedirectConfig(),
+  private val probeConfig: AdmProbeConfig = AdmProbeConfig(),
   private val clock: () -> Long = System::currentTimeMillis,
   private val publicSuffixMatcher: PublicSuffixMatcher = PublicSuffixMatcher.NONE,
+  private val ruleVersionProvider: () -> Long = { 0L },
 ) : HttpEngine {
 
   constructor(
@@ -32,11 +38,15 @@ class AdmHttpEngine(
     redirectConfig: AdmRedirectConfig = AdmRedirectConfig(),
     clock: () -> Long = System::currentTimeMillis,
     publicSuffixMatcher: PublicSuffixMatcher = PublicSuffixMatcher.NONE,
+    probeConfig: AdmProbeConfig = AdmProbeConfig(),
+    ruleVersionProvider: () -> Long = { 0L },
   ) : this(
     rootResources = RootResources(transport = transport),
     redirectConfig = redirectConfig,
+    probeConfig = probeConfig,
     clock = clock,
     publicSuffixMatcher = publicSuffixMatcher,
+    ruleVersionProvider = ruleVersionProvider,
   )
 
   constructor(
@@ -44,14 +54,18 @@ class AdmHttpEngine(
     redirectConfig: AdmRedirectConfig = AdmRedirectConfig(),
     clock: () -> Long = System::currentTimeMillis,
     publicSuffixMatcher: PublicSuffixMatcher = PublicSuffixMatcher.NONE,
+    probeConfig: AdmProbeConfig = AdmProbeConfig(),
+    ruleVersionProvider: () -> Long = { 0L },
   ) : this(
     rootResources = RootResources(
       transport = AdmTransportHttpEngineBridge(admTransport),
       admTransport = admTransport,
     ),
     redirectConfig = redirectConfig,
+    probeConfig = probeConfig,
     clock = clock,
     publicSuffixMatcher = publicSuffixMatcher,
+    ruleVersionProvider = ruleVersionProvider,
   )
 
   private val activeTasks = ConcurrentHashMap<String, AdmTaskState>()
@@ -61,6 +75,8 @@ class AdmHttpEngine(
   internal fun activeTaskState(taskId: String): AdmTaskState? = activeTasks[taskId]
 
   internal fun taskCookies(taskId: String): TaskCookieJar? = activeTasks[taskId]?.cookies
+
+  internal fun taskProbeCache(taskId: String): ProbeCache? = activeTasks[taskId]?.probeCache
 
   private fun activeTransport(): HttpEngine {
     if (rootClosed.get() || rootResources.isClosed) {
@@ -83,6 +99,8 @@ class AdmHttpEngine(
           clock = clock,
           publicSuffixMatcher = publicSuffixMatcher,
           redirectConfig = redirectConfig,
+          probeConfig = probeConfig,
+          ruleVersionProvider = ruleVersionProvider,
         )
       }
     }!!
@@ -275,7 +293,29 @@ class AdmHttpEngine(
       return activeDelegate().head(url, effectiveHeaders)
     }
 
+    internal suspend fun probeAdm(
+      url: String,
+      headers: Map<String, String> = emptyMap(),
+      method: String = "GET",
+      headHint: ServerInfo? = null,
+      validators: ProbeValidators? = null,
+    ): AdmProbeResult {
+      val transport = activeAdmTransport() ?: HttpEngineAdmTransport(activeDelegate())
+      return state.admProbe.probe(
+        url = url,
+        transport = transport,
+        headers = headers,
+        method = method,
+        headHint = headHint,
+        validators = validators,
+      )
+    }
+
     override suspend fun probe(url: String, headers: Map<String, String>): ServerInfo {
+      val adm = activeAdmTransport()
+      if (adm != null) {
+        return state.admProbe.probe(url = url, transport = adm, headers = headers).serverInfo
+      }
       val effectiveHeaders = withJarCookie(url, headers)
       return activeDelegate().probe(url, effectiveHeaders)
     }

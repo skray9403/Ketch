@@ -5,6 +5,7 @@ import com.linroid.ketch.core.engine.HttpBody
 import com.linroid.ketch.core.engine.HttpEngine
 import com.linroid.ketch.core.engine.HttpReply
 import com.linroid.ketch.core.engine.ServerInfo
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Request body metadata for [AdmRequest], distinguishing replayable bodies from one-shot bodies
@@ -34,6 +35,75 @@ sealed interface AdmRequestBody {
 fun HttpBody.toAdmBody(): AdmRequestBody = AdmRequestBody.Replayable(bytes = bytes, contentType = contentType)
 
 /**
+ * Pull-based streaming response body so [com.linroid.ketch.adm.http.probe.AdmProbe] can inspect
+ * up to `maxPrefixBytes` without buffering the entire response in memory.
+ */
+interface AdmResponseBody {
+  /**
+   * Reads the next non-empty chunk of up to [maxBytes] bytes, or returns `null` on EOF.
+   */
+  suspend fun readChunk(maxBytes: Int = DEFAULT_CHUNK_SIZE): ByteArray?
+
+  /** Closes the underlying stream. Idempotent. */
+  fun close()
+
+  companion object {
+    const val DEFAULT_CHUNK_SIZE: Int = 8192
+
+    fun fromBytes(bytes: ByteArray): AdmResponseBody = ByteArrayResponseBody(bytes)
+
+    fun fromChunks(chunks: List<ByteArray>, onClose: () -> Unit = {}): AdmResponseBody =
+      ChunkListResponseBody(chunks, onClose)
+  }
+}
+
+private class ByteArrayResponseBody(
+  private val bytes: ByteArray,
+) : AdmResponseBody {
+  private var offset = 0
+  private val closed = AtomicBoolean(false)
+
+  override suspend fun readChunk(maxBytes: Int): ByteArray? {
+    if (closed.get() || offset >= bytes.size) return null
+    val count = minOf(maxBytes, bytes.size - offset).coerceAtLeast(1)
+    val slice = bytes.copyOfRange(offset, offset + count)
+    offset += count
+    return slice
+  }
+
+  override fun close() {
+    closed.set(true)
+  }
+}
+
+private class ChunkListResponseBody(
+  chunks: List<ByteArray>,
+  private val onClose: () -> Unit,
+) : AdmResponseBody {
+  private val queue = ArrayDeque(chunks.filter { it.isNotEmpty() }.map { it.copyOf() })
+  private val closed = AtomicBoolean(false)
+
+  override suspend fun readChunk(maxBytes: Int): ByteArray? {
+    if (closed.get()) return null
+    val head = queue.removeFirstOrNull() ?: return null
+    if (head.size <= maxBytes) {
+      return head
+    }
+    val prefix = head.copyOfRange(0, maxBytes)
+    val rest = head.copyOfRange(maxBytes, head.size)
+    queue.addFirst(rest)
+    return prefix
+  }
+
+  override fun close() {
+    if (closed.compareAndSet(false, true)) {
+      queue.clear()
+      onClose()
+    }
+  }
+}
+
+/**
  * Multi-header HTTP request used inside `:adm-http` so headers like `Cookie` or custom headers
  * are preserved without comma-joining.
  */
@@ -54,7 +124,7 @@ data class AdmRequest(
     copy(headers = headers.filterNot { (k, _) -> names.any { k.equals(it, ignoreCase = true) } })
 
   fun withHeader(name: String, value: String): AdmRequest =
-    withoutHeaders(name).copy(headers = withoutHeaders(name).headers + (name to value))
+    withoutHeaders(name).let { stripped -> stripped.copy(headers = stripped.headers + (name to value)) }
 
   fun toHeaderMap(): Map<String, String> {
     if (headers.isEmpty()) return emptyMap()
@@ -78,6 +148,7 @@ data class AdmResponse(
   val body: ByteArray = ByteArray(0),
   val url: String? = null,
   val serverInfo: ServerInfo? = null,
+  val streamingBody: AdmResponseBody? = null,
 ) {
   val isRedirect: Boolean
     get() = status == 301 || status == 302 || status == 303 || status == 307 || status == 308
@@ -85,6 +156,8 @@ data class AdmResponse(
   fun header(name: String): String? = headers[name.lowercase()]?.firstOrNull()
 
   fun headers(name: String): List<String> = headers[name.lowercase()].orEmpty()
+
+  fun openBody(): AdmResponseBody = streamingBody ?: AdmResponseBody.fromBytes(body)
 
   fun toHttpReply(finalUrl: String? = url): HttpReply = HttpReply(
     status = status,
@@ -111,6 +184,14 @@ data class AdmResponse(
  */
 interface AdmHttpTransport {
   suspend fun execute(request: AdmRequest): AdmResponse
+
+  /**
+   * Opens a streaming response without buffering the entire body.
+   *
+   * Implementations that support lazy streaming should return an [AdmResponse] with
+   * [AdmResponse.streamingBody] populated. Defaults to [execute].
+   */
+  suspend fun openStream(request: AdmRequest): AdmResponse = execute(request)
 
   /**
    * Streams a download response.
