@@ -35,6 +35,7 @@ plugins {
 }
 
 // Library modules
+include(":adm-http")
 include(":library:core")
 include(":library:api")
 include(":library:remote")

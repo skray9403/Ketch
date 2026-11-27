@@ -29,7 +29,7 @@ class KetchConnectionsTest {
   fun download_fourSegments_showFourConnectionsUntilComplete() = runTest {
     val gate = CompletableDeferred<Unit>()
     val fake = FakeHttpEngine()
-    val engine = object : HttpEngine by fake {
+    val engine = object : FakeHttpEngine() {
       override suspend fun download(
         url: String,
         range: LongRange?,

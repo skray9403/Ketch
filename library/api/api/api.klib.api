@@ -1602,6 +1602,17 @@ final class com.linroid.ketch.api/SystemInfo { // com.linroid.ketch.api/SystemIn
     }
 }
 
+final class com.linroid.ketch.api/UnsatisfiedRangeResponse : kotlin/IllegalStateException { // com.linroid.ketch.api/UnsatisfiedRangeResponse|null[0]
+    constructor <init>(kotlin/Long?, kotlin/String?, kotlin/String?, kotlin/Throwable? = ...) // com.linroid.ketch.api/UnsatisfiedRangeResponse.<init>|<init>(kotlin.Long?;kotlin.String?;kotlin.String?;kotlin.Throwable?){}[0]
+
+    final val etag // com.linroid.ketch.api/UnsatisfiedRangeResponse.etag|{}etag[0]
+        final fun <get-etag>(): kotlin/String? // com.linroid.ketch.api/UnsatisfiedRangeResponse.etag.<get-etag>|<get-etag>(){}[0]
+    final val lastModified // com.linroid.ketch.api/UnsatisfiedRangeResponse.lastModified|{}lastModified[0]
+        final fun <get-lastModified>(): kotlin/String? // com.linroid.ketch.api/UnsatisfiedRangeResponse.lastModified.<get-lastModified>|<get-lastModified>(){}[0]
+    final val totalBytes // com.linroid.ketch.api/UnsatisfiedRangeResponse.totalBytes|{}totalBytes[0]
+        final fun <get-totalBytes>(): kotlin/Long? // com.linroid.ketch.api/UnsatisfiedRangeResponse.totalBytes.<get-totalBytes>|<get-totalBytes>(){}[0]
+}
+
 final value class com.linroid.ketch.api/Destination { // com.linroid.ketch.api/Destination|null[0]
     constructor <init>(kotlin/String) // com.linroid.ketch.api/Destination.<init>|<init>(kotlin.String){}[0]
 

@@ -9,6 +9,7 @@ import com.linroid.ketch.core.segment.SegmentDownloader
 import com.linroid.ketch.core.engine.ServerInfo
 import com.linroid.ketch.core.segment.SegmentCalculator
 import com.linroid.ketch.core.segment.SegmentLedger
+import com.linroid.ketch.core.segment.SequentialLengthMismatchException
 import com.linroid.ketch.engine.FakeHttpEngine
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
@@ -147,5 +148,76 @@ class SegmentDownloaderTest {
 
     assertEquals(250, bytesReceived)
     assertEquals(1, engine.downloadCallCount)
+  }
+
+  @Test
+  fun download_useRangeFalse_rejectsNonZeroStartOrOffsetAndSendsNullRange() = runTest {
+    val nonZeroStart = SegmentLedger(listOf(Segment(index = 0, start = 4, end = 7))).initialLanes.single()
+    assertFailsWith<IllegalArgumentException> {
+      SegmentDownloader(FakeHttpEngine(), NoOpFileAccessor)
+        .download("https://example.com/file", nonZeroStart, useRange = false)
+    }
+
+    val nonZeroOffset = SegmentLedger(
+      listOf(Segment(index = 0, start = 0, end = 7, downloadedBytes = 3)),
+    ).initialLanes.single()
+    assertFailsWith<IllegalArgumentException> {
+      SegmentDownloader(FakeHttpEngine(), NoOpFileAccessor)
+        .download("https://example.com/file", nonZeroOffset, useRange = false)
+    }
+
+    var seenRange: LongRange? = 0L..1L
+    val engine = object : FakeHttpEngine() {
+      override suspend fun download(
+        url: String,
+        range: LongRange?,
+        headers: Map<String, String>,
+        onData: suspend (ByteArray) -> Unit,
+      ) {
+        seenRange = range
+        onData(byteArrayOf(10, 20, 30, 40))
+      }
+    }
+    val lane = SegmentLedger(listOf(Segment(index = 0, start = 0, end = 3))).initialLanes.single()
+    SegmentDownloader(engine, NoOpFileAccessor)
+      .download("https://example.com/file", lane, useRange = false)
+    assertEquals(null, seenRange)
+    assertTrue(lane.isComplete)
+  }
+
+  @Test
+  fun download_useRangeFalse_emptyAndOversizedThrowSequentialLengthMismatch() = runTest {
+    val emptyEngine = object : FakeHttpEngine() {
+      override suspend fun download(
+        url: String,
+        range: LongRange?,
+        headers: Map<String, String>,
+        onData: suspend (ByteArray) -> Unit,
+      ) {}
+    }
+    val lane1 = SegmentLedger(listOf(Segment(index = 0, start = 0, end = 3))).initialLanes.single()
+    val emptyError = assertFailsWith<KetchError.Unsupported> {
+      SegmentDownloader(emptyEngine, NoOpFileAccessor)
+        .download("https://example.com/file", lane1, useRange = false)
+    }
+    assertTrue(emptyError.cause is SequentialLengthMismatchException)
+
+    val oversizedEngine = object : FakeHttpEngine() {
+      override suspend fun download(
+        url: String,
+        range: LongRange?,
+        headers: Map<String, String>,
+        onData: suspend (ByteArray) -> Unit,
+      ) {
+        onData(byteArrayOf(1, 2, 3, 4, 5))
+      }
+    }
+    val lane2 = SegmentLedger(listOf(Segment(index = 0, start = 0, end = 3))).initialLanes.single()
+    val oversizedError = assertFailsWith<KetchError.Unsupported> {
+      SegmentDownloader(oversizedEngine, NoOpFileAccessor)
+        .download("https://example.com/file", lane2, useRange = false)
+    }
+    assertTrue(oversizedError.cause is SequentialLengthMismatchException)
+    assertTrue(lane2.isComplete)
   }
 }

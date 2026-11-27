@@ -190,3 +190,19 @@ internal object KetchErrorSerializer : KSerializer<KetchError> {
   private fun JsonObject.string(key: String): String? =
     (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
 }
+
+/**
+ * Details carried as the transient [KetchError.Http.cause] when a server answers HTTP `416`
+ * (`Range Not Satisfiable`).
+ *
+ * @property totalBytes the resource's complete length from `Content-Range: bytes &#42;/N`, or `null`
+ *   when the header was absent, malformed, or `bytes &#42;/&#42;`
+ * @property etag the response's `ETag` header, if present
+ * @property lastModified the response's `Last-Modified` header, if present
+ */
+class UnsatisfiedRangeResponse(
+  val totalBytes: Long?,
+  val etag: String?,
+  val lastModified: String?,
+  cause: Throwable? = null,
+) : IllegalStateException("HTTP range not satisfiable", cause)

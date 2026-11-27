@@ -3,6 +3,7 @@ package com.linroid.ketch.engine
 import com.linroid.ketch.api.KetchApi
 import com.linroid.ketch.api.KetchError
 import com.linroid.ketch.api.Proxy
+import com.linroid.ketch.api.UnsatisfiedRangeResponse
 import com.linroid.ketch.api.log.KetchLogger
 import com.linroid.ketch.api.log.LogLevel
 import com.linroid.ketch.api.log.Logger
@@ -759,6 +760,75 @@ class KtorHttpEngineTest {
         engine.request("GET /x", "https://example.com/file")
       }
       assertTrue(requests.isEmpty())
+    }
+  }
+
+  @Test
+  fun download_http416_attachesUnsatisfiedRangeResponseWithParsedHeaders() = runTest {
+    val cases = listOf(
+      "bytes */1024" to 1024L,
+      "BYTES  */0" to 0L,
+      "bytes */*" to null,
+      "bytes 0-9/100" to null,
+      "malformed" to null,
+    )
+    for ((contentRange, expectedTotal) in cases) {
+      withServer({
+        respond(
+          "",
+          HttpStatusCode.RequestedRangeNotSatisfiable,
+          headersOf(
+            HttpHeaders.ContentRange to listOf(contentRange),
+            HttpHeaders.ETag to listOf("\"v2\""),
+            HttpHeaders.LastModified to listOf("Wed, 01 Jan 2025 00:00:00 GMT"),
+          ),
+        )
+      }) { engine, _ ->
+        val error = assertFailsWith<KetchError.Http>(contentRange) {
+          engine.download(URL, 0L..9L) {}
+        }
+        assertEquals(416, error.code)
+        val details = assertIs<UnsatisfiedRangeResponse>(error.cause, contentRange)
+        assertEquals(expectedTotal, details.totalBytes, contentRange)
+        assertEquals("\"v2\"", details.etag, contentRange)
+        assertEquals("Wed, 01 Jan 2025 00:00:00 GMT", details.lastModified, contentRange)
+        assertIs<FailedRequest>(details.cause)
+      }
+    }
+  }
+
+  @Test
+  fun download_http416ThroughWithProxy_preservesUnsatisfiedRangeResponse() = runTest {
+    val client = HttpClient(MockEngine {
+      respond(
+        "",
+        HttpStatusCode.RequestedRangeNotSatisfiable,
+        headersOf(
+          HttpHeaders.ContentRange to listOf("bytes */512"),
+          HttpHeaders.ETag to listOf("\"proxied-etag\""),
+          HttpHeaders.LastModified to listOf("Thu, 02 Jan 2025 00:00:00 GMT"),
+        ),
+      )
+    })
+    val transports = object : HttpTransports {
+      override fun supports(proxy: Proxy): Boolean = true
+      override fun clientFor(url: Url, proxy: Proxy): RoutedClient =
+        RoutedClient(client, ProxyRoute.Http("proxy.test", 3128))
+      override fun close() = client.close()
+    }
+    val root = KtorHttpEngine(transports, logRequests = true, userAgent = KtorHttpEngine.DEFAULT_USER_AGENT)
+    try {
+      val proxied = root.withProxy(Proxy.Manual("http://proxy.test:3128"))
+      val error = assertFailsWith<KetchError.Http> {
+        proxied.download(URL, 0L..9L) {}
+      }
+      assertEquals(416, error.code)
+      val details = assertIs<UnsatisfiedRangeResponse>(error.cause)
+      assertEquals(512L, details.totalBytes)
+      assertEquals("\"proxied-etag\"", details.etag)
+      assertEquals("Thu, 02 Jan 2025 00:00:00 GMT", details.lastModified)
+    } finally {
+      root.close()
     }
   }
 

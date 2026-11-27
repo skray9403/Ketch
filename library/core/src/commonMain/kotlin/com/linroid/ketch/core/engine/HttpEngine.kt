@@ -1,7 +1,40 @@
+@file:OptIn(ExperimentalAtomicApi::class)
+
 package com.linroid.ketch.core.engine
 
 import com.linroid.ketch.api.KetchError
 import com.linroid.ketch.api.Proxy
+import kotlin.concurrent.atomics.AtomicBoolean
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
+
+/**
+ * Identifies a single execution lifetime of a logical task.
+ *
+ * Closing one generation must not invalidate a later task created with the same [taskId].
+ */
+data class TaskGeneration(
+  val taskId: String,
+  val generationId: Long,
+)
+
+/**
+ * Lifecycle gate for task-scoped HTTP views.
+ *
+ * Implementations may back this with [AdmTaskState] in `:adm-http` or a lightweight
+ * generation check in core tests.
+ */
+fun interface TaskLifecycleGate {
+  fun checkActive(generation: TaskGeneration)
+}
+
+/**
+ * Thrown when an operation is attempted on a borrowed task view whose task generation
+ * is no longer active.
+ */
+class InactiveTaskEngineException(
+  val generation: TaskGeneration,
+  message: String = "Task engine is closed or inactive: taskId=${generation.taskId}, generation=${generation.generationId}",
+) : IllegalStateException(message)
 
 /**
  * Abstraction over the HTTP layer used by Ketch.
@@ -10,6 +43,22 @@ import com.linroid.ketch.api.Proxy
  * Implement this interface to plug in a different HTTP client.
  */
 interface HttpEngine {
+  /**
+   * Returns a borrowed, task-scoped view over this engine for [taskId] and [generationId].
+   *
+   * Closing the returned view or any proxy view derived from it must never close this
+   * engine or its underlying transports.
+   */
+  fun forTask(
+    taskId: String,
+    generationId: Long = 0L,
+    lifecycleGate: TaskLifecycleGate = TaskLifecycleGate { },
+  ): HttpEngine = BorrowedTaskHttpEngine(
+    delegate = this,
+    generation = TaskGeneration(taskId = taskId, generationId = generationId),
+    lifecycleGate = lifecycleGate,
+  )
+
   /**
    * Performs an HTTP HEAD request to retrieve server metadata.
    *
@@ -124,6 +173,105 @@ interface HttpEngine {
 
   /** Releases underlying resources (e.g., the HTTP client). */
   fun close()
+}
+
+/**
+ * Non-owning view scoped to a specific [TaskGeneration].
+ *
+ * Enforces generation validity on every operation and never closes the root engine.
+ */
+@OptIn(ExperimentalAtomicApi::class)
+internal class BorrowedTaskHttpEngine(
+  private val delegate: HttpEngine,
+  val generation: TaskGeneration,
+  private val lifecycleGate: TaskLifecycleGate,
+  private val parentClosed: AtomicBoolean? = null,
+  private val closed: AtomicBoolean = AtomicBoolean(false),
+) : HttpEngine {
+
+  private fun isClosed(): Boolean = closed.load() || (parentClosed?.load() == true)
+
+  private fun activeDelegate(): HttpEngine {
+    if (isClosed()) {
+      throw InactiveTaskEngineException(generation)
+    }
+    lifecycleGate.checkActive(generation)
+    return delegate
+  }
+
+  override suspend fun head(url: String, headers: Map<String, String>): ServerInfo =
+    activeDelegate().head(url, headers)
+
+  override suspend fun probe(url: String, headers: Map<String, String>): ServerInfo =
+    activeDelegate().probe(url, headers)
+
+  override suspend fun download(
+    url: String,
+    range: LongRange?,
+    headers: Map<String, String>,
+    onData: suspend (ByteArray) -> Unit,
+  ) {
+    activeDelegate().download(url, range, headers, onData)
+  }
+
+  override suspend fun downloadResource(
+    url: String,
+    headers: Map<String, String>,
+    onData: suspend (ByteArray) -> Unit,
+  ): String = activeDelegate().downloadResource(url, headers, onData)
+
+  override suspend fun request(
+    method: String,
+    url: String,
+    headers: Map<String, String>,
+    body: HttpBody?,
+    maxBodyBytes: Int,
+  ): HttpReply = activeDelegate().request(method, url, headers, body, maxBodyBytes)
+
+  override val supportsProxies: Boolean
+    get() = activeDelegate().supportsProxies
+
+  override fun forTask(
+    taskId: String,
+    generationId: Long,
+    lifecycleGate: TaskLifecycleGate,
+  ): HttpEngine {
+    val target = TaskGeneration(taskId = taskId, generationId = generationId)
+    if (isClosed()) {
+      throw InactiveTaskEngineException(target)
+    }
+    this.lifecycleGate.checkActive(this.generation)
+    lifecycleGate.checkActive(target)
+    return BorrowedTaskHttpEngine(
+      delegate = delegate,
+      generation = target,
+      lifecycleGate = lifecycleGate,
+    )
+  }
+
+  override fun withProxy(proxy: Proxy): HttpEngine {
+    if (isClosed()) {
+      throw InactiveTaskEngineException(generation)
+    }
+    lifecycleGate.checkActive(generation)
+    if (proxy == Proxy.System) {
+      return this
+    }
+    val proxiedDelegate = delegate.withProxy(proxy)
+    return BorrowedTaskHttpEngine(
+      delegate = proxiedDelegate,
+      generation = generation,
+      lifecycleGate = lifecycleGate,
+      parentClosed = parentClosed ?: closed,
+    )
+  }
+
+  /**
+   * Releases only this borrowed view's local handle; never closes [delegate].
+   */
+  override fun close() {
+    closed.store(true)
+  }
 }
 
 /** This engine for [Proxy.System], which it follows by itself, else [HttpEngine.withProxy]. */

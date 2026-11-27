@@ -10,6 +10,7 @@ import com.linroid.ketch.api.DownloadTask
 import com.linroid.ketch.api.KetchError
 import com.linroid.ketch.core.Ketch
 import com.linroid.ketch.core.engine.HttpEngine
+import com.linroid.ketch.core.engine.TaskLifecycleGate
 import com.linroid.ketch.sqlite.DriverFactory
 import com.linroid.ketch.sqlite.SqliteTaskStore
 import com.sun.net.httpserver.HttpServer
@@ -72,7 +73,7 @@ class HttpDownloadIntegrationTest {
       val state = task.state.first { it.isTerminal }
       assertContentEquals(fixture.content, File(assertIs<DownloadState.Completed>(state).outputPath)
         .readBytes())
-      assertEquals(listOf("bytes=0-65538", "bytes=0-65538"), fixture.requests.toList())
+      assertEquals(listOf("none", "none"), fixture.requests.toList())
     }
   }
 
@@ -106,7 +107,7 @@ class HttpDownloadIntegrationTest {
       val state = fixture.download(connections = 4)
       val file = File(assertIs<DownloadState.Completed>(state).outputPath)
       assertContentEquals(fixture.content, file.readBytes())
-      assertEquals("bytes=0-65538", fixture.requests.last())
+      assertEquals("none", fixture.requests.last())
     }
   }
 
@@ -385,6 +386,12 @@ class HttpDownloadIntegrationTest {
     private fun newKetch(): Ketch {
       val transport = KtorHttpEngine()
       val engine = object : HttpEngine by transport {
+        override fun forTask(
+          taskId: String,
+          generationId: Long,
+          lifecycleGate: TaskLifecycleGate,
+        ): HttpEngine = super<HttpEngine>.forTask(taskId, generationId, lifecycleGate)
+
         override suspend fun download(
           url: String,
           range: LongRange?,

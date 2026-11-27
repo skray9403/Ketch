@@ -133,6 +133,7 @@ jobs:
           :library:hls:testAndroidHostTest :library:dash:testAndroidHostTest
           :library:ktor:testAndroidHostTest
           :library:metalink:testAndroidHostTest
+          :adm-http:testAndroidHostTest
 
       - name: Upload test results
         if: always()

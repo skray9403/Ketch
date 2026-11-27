@@ -223,6 +223,17 @@ internal class DownloadExecution(
   /** The output paths held in [OutputPathReservations] until this execution stops. */
   private val reservedPaths = mutableListOf<String>()
 
+  private var taskScopedSource: DownloadSource<*>? = null
+
+  private fun taskScopedSource(source: DownloadSource<*>): DownloadSource<*> {
+    return if (source is HttpDownloadSource) {
+      val generation = handle.record.value.control?.selectionGeneration ?: 0L
+      source.forTask(taskId, generation).also { taskScopedSource = it }
+    } else {
+      source
+    }
+  }
+
   /**
    * Executes a download — either fresh or resumed.
    *
@@ -238,6 +249,11 @@ internal class DownloadExecution(
         executeFresh()
       }
     } finally {
+      try {
+        taskScopedSource?.close()
+      } catch (e: Exception) {
+        log.w(e) { "Failed to close task-scoped source for taskId=$taskId" }
+      }
       reservedPaths.forEach(OutputPathReservations::release)
       reservedPaths.clear()
     }
@@ -273,30 +289,32 @@ internal class DownloadExecution(
 
   private suspend fun executeFresh() {
     val stored = storedResolution()
-    val source: DownloadSource<*>
-    val resolvedUrl: ResolvedSource
+    val baseSource: DownloadSource<*>
+    var resolvedUrl: ResolvedSource? = null
     val resolved = request.resolvedSource
 
     if (stored != null) {
       log.d { "Starting taskId=$taskId from its saved source state, source=${stored.first.type}" }
-      source = stored.first
+      baseSource = stored.first
       resolvedUrl = stored.second
     } else if (resolved != null) {
       log.d {
         "Using pre-resolved info for taskId=$taskId: url=${redactUrl(request.url)}, " +
           "source=${resolved.sourceType}"
       }
-      source = sourceResolver.resolveByType(resolved.sourceType, resolved.url)
+      baseSource = sourceResolver.resolveByType(resolved.sourceType, resolved.url)
       resolvedUrl = resolved
     } else {
-      source = sourceResolver.resolve(request.url)
+      baseSource = sourceResolver.resolve(request.url)
       log.d {
-        "Resolved source '${source.type}' for taskId=$taskId: url=${redactUrl(request.url)}"
+        "Resolved source '${baseSource.type}' for taskId=$taskId: url=${redactUrl(request.url)}"
       }
-      resolvedUrl = downloadWithRetry { resolveFresh(source) }
     }
 
-    runDownload(source) { prepareFresh(source, resolvedUrl, fromStored = stored != null) }
+    val source = taskScopedSource(baseSource)
+    val finalResolved = resolvedUrl ?: downloadWithRetry { resolveFresh(source) }
+
+    runDownload(source) { prepareFresh(source, finalResolved, fromStored = stored != null) }
   }
 
   /**
@@ -539,11 +557,12 @@ internal class DownloadExecution(
           "No sourceType for taskId=${taskRecord.taskId}",
         ),
       )
-    val source = sourceResolver.resolveByType(sourceType, taskRecord.request.url)
+    val baseSource = sourceResolver.resolveByType(sourceType, taskRecord.request.url)
     log.i {
       "Resuming download for taskId=$taskId via " +
-        "source '${source.type}'"
+        "source '${baseSource.type}'"
     }
+    val source = taskScopedSource(baseSource)
 
     val outputPath = taskRecord.outputPath
       ?: throw KetchError.Unknown(

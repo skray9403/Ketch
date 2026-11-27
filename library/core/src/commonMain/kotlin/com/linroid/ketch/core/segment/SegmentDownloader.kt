@@ -11,6 +11,10 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 
+internal class SequentialLengthMismatchException(
+  message: String = "Sequential response length mismatch",
+) : IllegalStateException(message)
+
 internal class SegmentDownloader(
   private val httpEngine: HttpEngine,
   private val fileAccessor: FileAccessor,
@@ -23,22 +27,37 @@ internal class SegmentDownloader(
   private val owner = taskId?.let { " for taskId=$it" }.orEmpty()
 
   /**
-   * Downloads [lane] with one Range request from its offset to its end. The response is closed
-   * early when another connection takes over the lane's tail meanwhile.
+   * Downloads [lane] with one Range request from its offset to its end when [useRange] is `true`,
+   * or a sequential full-resource request (`range = null`) starting at byte zero when `false`.
+   * The response is closed early when another connection takes over the lane's tail meanwhile.
    */
   suspend fun download(
     url: String,
     lane: SegmentLane,
     headers: Map<String, String> = emptyMap(),
     handle: ConnectionHandle = ConnectionHandle.None,
+    useRange: Boolean = true,
   ) {
     if (lane.isComplete) return
-    val range = lane.offset..lane.end
-    log.d {
-      "Starting range ${range.first}..${range.last}$owner " +
-        "(${range.last - range.first + 1} bytes remaining)"
+    if (!useRange) {
+      require(lane.start == 0L && lane.offset == 0L) {
+        "Sequential full-resource download must start at byte 0 " +
+          "(start=${lane.start}, offset=${lane.offset})"
+      }
     }
-    var writeOffset = range.first
+    val range = if (useRange) lane.offset..lane.end else null
+    if (range != null) {
+      log.d {
+        "Starting range ${range.first}..${range.last}$owner " +
+          "(${range.last - range.first + 1} bytes remaining)"
+      }
+    } else {
+      log.d {
+        "Starting sequential full-resource request 0..${lane.end}$owner " +
+          "(${lane.end + 1} bytes expected)"
+      }
+    }
+    var writeOffset = range?.first ?: 0L
 
     watchdog.watch { monitor ->
       httpEngine.download(url, range, headers) { data ->
@@ -64,23 +83,44 @@ internal class SegmentDownloader(
           lane.commit(allowed)
         }
         if (allowed < data.size) {
-          throw KetchError.Unsupported(IllegalStateException("Response exceeds segment boundary"))
+          throw KetchError.Unsupported(
+            if (useRange) {
+              IllegalStateException("Response exceeds segment boundary")
+            } else {
+              SequentialLengthMismatchException(
+                "Sequential response exceeded expected length ${lane.end + 1}",
+              )
+            },
+          )
         }
       }
     }
 
     if (!lane.isComplete) {
+      if (!useRange) {
+        val expectedBytes = lane.end + 1
+        log.w {
+          "Sequential response length mismatch$owner: " +
+            "received $writeOffset of $expectedBytes bytes"
+        }
+        throw KetchError.Unsupported(
+          SequentialLengthMismatchException(
+            "Sequential response length mismatch: received $writeOffset of $expectedBytes bytes",
+          ),
+        )
+      }
+      val startOffset = range!!.first
       log.w {
-        "Incomplete range ${range.first}..${lane.end}$owner: " +
-          "downloaded ${writeOffset - range.first}/${lane.end - range.first + 1} bytes"
+        "Incomplete range $startOffset..${lane.end}$owner: " +
+          "downloaded ${writeOffset - startOffset}/${lane.end - startOffset + 1} bytes"
       }
       throw KetchError.Network(
         Exception(
           "Connection closed prematurely: received " +
-            "${writeOffset - range.first} of ${lane.end - range.first + 1} bytes"
+            "${writeOffset - startOffset} of ${lane.end - startOffset + 1} bytes"
         )
       )
     }
-    log.d { "Completed range ${range.first}..${lane.end}$owner" }
+    log.d { "Completed ${if (useRange) "range ${range!!.first}" else "sequential 0"}..${lane.end}$owner" }
   }
 }
