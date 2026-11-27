@@ -1,5 +1,7 @@
 package com.linroid.ketch.adm.http
 
+import com.linroid.ketch.adm.http.cookies.PublicSuffixMatcher
+import com.linroid.ketch.adm.http.cookies.TaskCookieJar
 import com.linroid.ketch.core.engine.InactiveTaskEngineException
 import com.linroid.ketch.core.engine.TaskGeneration
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -8,17 +10,35 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Per-task execution state bound to a single [TaskGeneration].
  *
- * Closing one [AdmTaskState] is irreversible and never invalidates a later generation created for
- * the same [taskId].
+ * Owns the task-scoped [cookies] jar and [redirectHandler]. Closing one [AdmTaskState] is
+ * irreversible and never invalidates a later generation created for the same [taskId].
  */
 class AdmTaskState(
   val taskId: String,
   val generationId: Long,
+  clock: () -> Long = System::currentTimeMillis,
+  publicSuffixMatcher: PublicSuffixMatcher = PublicSuffixMatcher.NONE,
+  redirectConfig: AdmRedirectConfig = AdmRedirectConfig(),
 ) {
   val generation: TaskGeneration = TaskGeneration(taskId = taskId, generationId = generationId)
 
   private val closed = AtomicBoolean(false)
   private val cleanupHooks = ConcurrentLinkedQueue<() -> Unit>()
+
+  val cookies: TaskCookieJar = TaskCookieJar(
+    taskState = this,
+    clock = clock,
+    publicSuffixMatcher = publicSuffixMatcher,
+  )
+
+  val redirectHandler: AdmRedirectHandler = AdmRedirectHandler(
+    taskState = this,
+    config = redirectConfig,
+  )
+
+  init {
+    onClose { cookies.clearOnClose() }
+  }
 
   val isClosed: Boolean get() = closed.get()
 
@@ -30,8 +50,8 @@ class AdmTaskState(
   }
 
   /**
-   * Registers a task-local cleanup hook to run when this generation closes (placeholder for
-   * per-task state in later slices). Runs immediately if already closed.
+   * Registers a task-local cleanup hook to run when this generation closes. Runs immediately if
+   * already closed.
    */
   internal fun onClose(hook: () -> Unit) {
     if (closed.get()) {
